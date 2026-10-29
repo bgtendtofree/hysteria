@@ -40,6 +40,11 @@ func (s *QStream) Write(p []byte) (n int, err error) {
 	return s.Stream.Write(p)
 }
 
+// CloseWrite sends a FIN without canceling reads from the peer.
+func (s *QStream) CloseWrite() error {
+	return s.Stream.Close()
+}
+
 func (s *QStream) Close() error {
 	s.Stream.CancelRead(0)
 	return s.Stream.Close()

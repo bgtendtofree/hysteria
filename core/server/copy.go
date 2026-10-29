@@ -44,37 +44,61 @@ func copyBufferLog(dst io.Writer, src io.Reader, log func(n uint64) bool) error 
 }
 
 func copyTwoWayEx(id string, serverRw, remoteRw io.ReadWriter, l TrafficLogger, stats *StreamStats) error {
-	errChan := make(chan error, 2)
-	go func() {
-		errChan <- copyBufferLog(serverRw, remoteRw, func(n uint64) bool {
+	return copyTwoWayWith(serverRw, remoteRw, func() error {
+		return copyBufferLog(serverRw, remoteRw, func(n uint64) bool {
 			stats.LastActiveTime.Store(time.Now())
 			stats.Rx.Add(n)
 			return l.LogTraffic(id, 0, n)
 		})
-	}()
-	go func() {
-		errChan <- copyBufferLog(remoteRw, serverRw, func(n uint64) bool {
+	}, func() error {
+		return copyBufferLog(remoteRw, serverRw, func(n uint64) bool {
 			stats.LastActiveTime.Store(time.Now())
 			stats.Tx.Add(n)
 			return l.LogTraffic(id, n, 0)
 		})
-	}()
-	// Block until one of the two goroutines returns
-	return <-errChan
+	})
 }
 
 // copyTwoWay is the "fast-path" version of copyTwoWayEx that does not log traffic or update stream stats.
 // It uses the built-in io.Copy instead of our own copyBufferLog.
 func copyTwoWay(serverRw, remoteRw io.ReadWriter) error {
-	errChan := make(chan error, 2)
-	go func() {
+	return copyTwoWayWith(serverRw, remoteRw, func() error {
 		_, err := io.Copy(serverRw, remoteRw)
-		errChan <- err
-	}()
-	go func() {
+		return err
+	}, func() error {
 		_, err := io.Copy(remoteRw, serverRw)
+		return err
+	})
+}
+
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// copyTwoWayWith shares EOF/error coordination between the fast and logged paths.
+// The caller owns full cleanup, which also unblocks the other copy on error.
+func copyTwoWayWith(serverRw, remoteRw io.ReadWriter, rx, tx func() error) error {
+	serverCW, serverOK := serverRw.(closeWriter)
+	remoteCW, remoteOK := remoteRw.(closeWriter)
+	// Without half-close support on both ends, retain first-completion behavior
+	// so the caller can fully close transports that cannot propagate a FIN.
+	halfClose := serverOK && remoteOK
+
+	errChan := make(chan error, 2)
+	copyAndClose := func(copyFunc func() error, dst closeWriter) {
+		err := copyFunc()
+		if err == nil && halfClose {
+			err = dst.CloseWrite()
+		}
 		errChan <- err
-	}()
-	// Block until one of the two goroutines returns
+	}
+	go copyAndClose(rx, serverCW)
+	go copyAndClose(tx, remoteCW)
+
+	if err := <-errChan; err != nil || !halfClose {
+		return err
+	}
+	// A clean EOF only finishes one direction. Let the reverse copy drain,
+	// unless it fails, without imposing a timeout on half-closed connections.
 	return <-errChan
 }

@@ -319,6 +319,24 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 		}
 		return
 	}
+	closeTCP := sync.OnceFunc(func() {
+		_ = tConn.Close()
+		_ = stream.Close()
+	})
+	// A peer STOP_SENDING must also interrupt a copy blocked on the outbound,
+	// where no QUIC Write would otherwise notice the cancellation.
+	stopStream := context.AfterFunc(stream.Context(), func() {
+		// Our normal CloseWrite cancels this context with context.Canceled.
+		// It must not terminate the still-active reverse direction.
+		if context.Cause(stream.Context()) != context.Canceled {
+			closeTCP()
+		}
+	})
+	defer stopStream()
+	// The stream context may already have ended normally before the connection
+	// fails, so observe the connection independently as well.
+	stopConn := context.AfterFunc(h.conn.Context(), closeTCP)
+	defer stopConn()
 	if !hooked {
 		_ = protocol.WriteTCPResponse(stream, true, "Connected")
 	}
@@ -339,8 +357,7 @@ func (h *h3sHandler) handleTCPRequest(stream *utils.QStream) {
 		h.config.EventLogger.TCPError(h.conn.RemoteAddr(), h.authID, reqAddr, err)
 	}
 	// Cleanup
-	_ = tConn.Close()
-	_ = stream.Close()
+	closeTCP()
 	// Disconnect the client if TrafficLogger requested
 	if err == errDisconnect {
 		_ = h.conn.CloseWithError(closeErrCodeTrafficLimitReached, "")
